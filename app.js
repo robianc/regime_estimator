@@ -864,6 +864,9 @@ function kalmanModelParams(returns, tauL_days = 10) {
           This tool is provided for <strong style="color:var(--text)">educational and research purposes only</strong>. It does not constitute financial advice, investment recommendations, or an offer or solicitation to buy or sell any financial instrument. All outputs — including regime labels, probability estimates, momentum values, and suggested exposure — are the result of an experimental statistical model and carry no guarantee of accuracy or fitness for any purpose.
           Past model performance, including any hit-rate figures shown in the historical replay panel, is <strong style="color:var(--text)">not indicative of future results</strong>. Markets are inherently unpredictable; no quantitative model eliminates risk.
           Price data is sourced from third-party public APIs and may be delayed, incomplete, or erroneous. The authors accept no liability for decisions made on the basis of this tool. Always consult a qualified financial professional before making investment decisions.
+          <div style="margin-top:14px;padding-top:10px;border-top:1px solid rgba(245,166,35,0.12);text-align:center;letter-spacing:0.08em">
+            Copyright 2026 Roberto Bianconi
+          </div>
         </div>
       `;
     }
