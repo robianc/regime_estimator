@@ -93,10 +93,3 @@ Past results shown by the model are **not indicative of future performance**. Ma
 Market data comes from third-party public sources and may contain gaps, delays, revisions, or errors. The authors and contributors assume no liability for losses or damages arising from the use of this software.
 
 If you use this code, you are responsible for validating the methodology, the data, and the suitability of the outputs for your own purposes.
-
-## Notes For GitHub Publication
-
-If you publish this repository, it is a good idea to keep both of these visible:
-
-- the Apache-2.0 license in the root,
-- the disclaimer in this README and in the UI itself.
