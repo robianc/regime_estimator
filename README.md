@@ -2,6 +2,8 @@
 
 Current version: `2026-05-03`
 
+https://robianc.github.io/regime_estimator
+
 A static browser app that estimates market regimes from a latent-momentum model inspired by the Langevin formulation used in convective boundary layer theory.
 
 The app runs entirely client-side and combines:
