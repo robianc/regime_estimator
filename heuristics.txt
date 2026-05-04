@@ -1,4 +1,4 @@
 Practical one-line heuristic
-Bullish guess if: regime is DOWNDRAFT with confidence > 40% AND drift is positive.
-Bearish guess if: regime is UPDRAFT with confidence > 40% AND drift is negative.
+Bullish guess if: regime is BULL with confidence > 40% AND drift is positive.
+Bearish guess if: regime is BEAR with confidence > 40% AND drift is negative.
 No trade if: TRANSITION, or drift and regime point in opposite directions.
