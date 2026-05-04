@@ -174,7 +174,7 @@ function kalmanModelParams(returns, tauL_days = 10) {
       const recent = returns.slice(-20);
       const volReal = Math.sqrt(recent.reduce((sum, value) => sum + value * value, 0) / recent.length) * Math.sqrt(252);
       const driftCurrent = (-vCurrent / Math.max(tau.tauL_days, 1)) + 0.5 * processVar * logPdfGradient(vCurrent, pdf);
-      const regime = confidence < 0.20 ? "TRANSITION" : probabilities.pCrash > probabilities.pBull ? "UPDRAFT" : "DOWNDRAFT";
+      const regime = confidence < 0.20 ? "TRANSITION" : probabilities.pCrash > probabilities.pBull ? "BEAR" : "BULL";
       const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
       const std = Math.sqrt(returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / returns.length);
       const skewness = returns.reduce((sum, value) => sum + ((value - mean) / std) ** 3, 0) / returns.length;
@@ -311,7 +311,7 @@ function kalmanModelParams(returns, tauL_days = 10) {
       },
       {
         title: "Atmospheric analogy behind the interface",
-        body: "In a convective boundary layer, updrafts are narrow and intense while downdrafts are broader and milder. That asymmetry creates a skewed velocity distribution that is well represented by a two-component Gaussian mixture. The financial translation flips the sign intuition: bear moves tend to be fast and concentrated, while bullish phases are often slower and more persistent. The app keeps that asymmetry by fitting a bimodal distribution to the estimated momentum series.",
+        body: "In a convective boundary layer, the two dominant flow modes are narrow, intense bursts and broader, milder returns. That asymmetry creates a skewed velocity distribution that is well represented by a two-component Gaussian mixture. The financial translation flips the sign intuition: bear moves tend to be fast and concentrated, while bullish phases are often slower and more persistent. The app keeps that asymmetry by fitting a bimodal distribution to the estimated momentum series.",
       },
       {
         title: "What the math is trying to preserve",
@@ -325,8 +325,8 @@ function kalmanModelParams(returns, tauL_days = 10) {
     const ANALOGY_ROWS = [
       ["Vertical position", "Log-price, the running market trajectory"],
       ["Vertical velocity", "Latent momentum v(t) inferred from returns"],
-      ["Updraft", "Fast adverse move or bear-like impulse"],
-      ["Downdraft", "Broader, slower bull regime"],
+      ["Bear regime", "Fast adverse move or bear-like impulse"],
+      ["Bull regime", "Broader, slower bull regime"],
       ["Velocity scale", "Volatility level"],
       ["Lagrangian time", "Memory or mean-reversion horizon tau_L"],
       ["Well-mixed condition", "A consistency constraint between dynamics and empirical distribution"],
@@ -351,17 +351,17 @@ function kalmanModelParams(returns, tauL_days = 10) {
     }
 
     function regimeColor(regime) {
-      return regime === "UPDRAFT" ? "#ff4757" : regime === "DOWNDRAFT" ? "#2ed573" : "#f5a623";
+      return regime === "BEAR" ? "#ff4757" : regime === "BULL" ? "#2ed573" : "#f5a623";
     }
 
     function adviceText(analysis) {
       if (!analysis) {
         return "";
       }
-      if (analysis.regime === "UPDRAFT") {
+      if (analysis.regime === "BEAR") {
         return "Bearish pressure detected. Consider trimming long exposure or hedging risk.";
       }
-      if (analysis.regime === "DOWNDRAFT") {
+      if (analysis.regime === "BULL") {
         return "Bullish momentum is stable. Long exposure remains favored with risk control.";
       }
       return "Neutral regime. Wait for confirmation before changing exposure.";
@@ -648,7 +648,7 @@ function kalmanModelParams(returns, tauL_days = 10) {
           <div class="rationale-grid">
             <div class="rationale-card">
               <h2>Stochastic Differential Core</h2>
-              <p>The application relies on Thomson's (1987) derivation where the Fokker-Planck equation corresponds to a Langevin process. By imposing the well-mixed condition, a particle starting in a region with specific distribution properties will dynamically remain consistent with that aggregate PDF. In finance, this translates to trend estimators preserving realistic skewness observed in bear/bull asymmetries rather than regressing linearly to an incorrect single mean.</p>
+              <p>The application relies on Thomson's (1987) derivation where the Fokker-Planck equation corresponds to a Langevin process (<i>Thomson D.J, 1987, Criteria for the selection of stochastic models of particle trajectories in turbulent flows, Journal of Fluid Mechanics, 180, 529-556</i>). By imposing the well-mixed condition, a particle starting in a region with specific distribution properties will dynamically remain consistent with that aggregate PDF. In finance, this translates to trend estimators preserving realistic skewness observed in bear/bull asymmetries rather than regressing linearly to an incorrect single mean.</p>
             </div>
             <div class="rationale-card">
               <h2>Limitations &amp; Mathematical Assumptions</h2>
@@ -707,9 +707,9 @@ function kalmanModelParams(returns, tauL_days = 10) {
       }
 
       if (state.status === "done" && analysis) {
-        const regimeTitle = analysis.regime === "UPDRAFT" ? "⬆ UPDRAFT" : analysis.regime === "DOWNDRAFT" ? "⬇ DOWNDRAFT" : "◆ TRANSITION";
-        const regimeSubtitle = analysis.regime === "UPDRAFT" ? "Bear-like state" : analysis.regime === "DOWNDRAFT" ? "Bull-like state" : "Low-confidence transition zone";
-        const exposureAction = analysis.regime === "UPDRAFT" ? "REDUCE EXPOSURE" : analysis.regime === "DOWNDRAFT" ? "MAINTAIN / ADD" : "NEUTRAL STANCE";
+        const regimeTitle = analysis.regime === "BEAR" ? "↓ BEAR" : analysis.regime === "BULL" ? "↑ BULL" : "◆ TRANSITION";
+        const regimeSubtitle = analysis.regime === "BEAR" ? "Bear state" : analysis.regime === "BULL" ? "Bull state" : "Low-confidence transition zone";
+        const exposureAction = analysis.regime === "BEAR" ? "REDUCE EXPOSURE" : analysis.regime === "BULL" ? "MAINTAIN / ADD" : "NEUTRAL STANCE";
 
         gridContent += `
           <div class="panel gauge-panel animate-in">
@@ -722,8 +722,8 @@ function kalmanModelParams(returns, tauL_days = 10) {
           <div class="panel prob-panel animate-in">
             <div class="panel-label">Posterior weights P(regime | v_t)</div>
             ${[
-              { label: "Updraft / Bear", val: analysis.pCrash, color: "#ff4757" },
-              { label: "Downdraft / Bull", val: analysis.pBull, color: "#2ed573" },
+              { label: "Bear", val: analysis.pCrash, color: "#ff4757" },
+              { label: "Bull", val: analysis.pBull, color: "#2ed573" },
             ].map((row) => `
               <div class="prob-row">
                 <div class="prob-header">
