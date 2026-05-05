@@ -1,30 +1,256 @@
-function kalmanModelParams(returns, tauL_days = 10) {
-      const dt = 1 / 252;
-      const tauL = tauL_days / 252;
-      const F = 1.0 - dt / tauL;
-      const varR = returns.reduce((sum, value) => sum + value * value, 0) / returns.length;
-      const alpha = 1 - Math.exp(-dt / tauL);
-      const Q = alpha * alpha * varR;
-      const R = Math.max(varR * (1 - alpha) ** 2, 1e-10);
-      return { dt, tauL, F, varR, alpha, Q, R };
-    }
-
-    function kalmanFilter(returns, tauL_days = 10) {
-      const { F, varR, Q, R } = kalmanModelParams(returns, tauL_days);
-      const v = new Array(returns.length).fill(0);
-      let P = varR;
-      let vEst = returns[0];
-
-      for (let index = 0; index < returns.length; index += 1) {
-        const vPred = F * vEst;
-        const PPred = F * F * P + Q;
-        const K = PPred / (PPred + R);
-        vEst = vPred + K * (returns[index] - vPred);
-        P = (1 - K) * PPred;
-        v[index] = vEst;
+function meanAndVariance(values) {
+      if (!values || values.length === 0) {
+        return { mean: 0, variance: 0 };
       }
 
-      return v;
+      const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+      const variance = values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length;
+      return { mean, variance };
+    }
+
+    function computeLogReturns(prices) {
+      const returns = [];
+      for (let index = 1; index < prices.length; index += 1) {
+        returns.push(Math.log(prices[index] / prices[index - 1]));
+      }
+      return returns;
+    }
+
+    const INTRADAY_PROFILES = {
+      "5m": {
+        key: "5m",
+        label: "5m bars",
+        yahooInterval: "5m",
+        yahooRange: "5d",
+        windowLabel: "5 trading days",
+        barMinutes: 5,
+        barsPerSession: 78,
+        defaultTauBars: 18,
+        minTauBars: 6,
+        maxTauBars: 156,
+        replayWarmupBars: 60,
+        replayRows: 12,
+      },
+      "15m": {
+        key: "15m",
+        label: "15m bars",
+        yahooInterval: "15m",
+        yahooRange: "1mo",
+        windowLabel: "1 trading month",
+        barMinutes: 15,
+        barsPerSession: 26,
+        defaultTauBars: 12,
+        minTauBars: 4,
+        maxTauBars: 52,
+        replayWarmupBars: 40,
+        replayRows: 12,
+      },
+    };
+    const DEFAULT_PROFILE_KEY = "5m";
+
+    function getMarketProfile(profileOrKey = DEFAULT_PROFILE_KEY) {
+      if (profileOrKey && typeof profileOrKey === "object" && "barMinutes" in profileOrKey && "barsPerSession" in profileOrKey) {
+        return {
+          ...profileOrKey,
+          key: profileOrKey.key || profileOrKey.intervalLabel || DEFAULT_PROFILE_KEY,
+          intervalLabel: profileOrKey.intervalLabel || profileOrKey.yahooInterval || DEFAULT_PROFILE_KEY,
+          annualizationBars: profileOrKey.annualizationBars || profileOrKey.barsPerSession * 252,
+          dtYears: profileOrKey.dtYears || 1 / ((profileOrKey.barsPerSession || 78) * 252),
+        };
+      }
+
+      const base = INTRADAY_PROFILES[profileOrKey] || INTRADAY_PROFILES[DEFAULT_PROFILE_KEY];
+      return {
+        ...base,
+        intervalLabel: base.yahooInterval,
+        annualizationBars: base.barsPerSession * 252,
+        dtYears: 1 / (base.barsPerSession * 252),
+      };
+    }
+
+    function formatTauClock(tauBars, marketProfileOrKey = DEFAULT_PROFILE_KEY) {
+      const marketProfile = getMarketProfile(marketProfileOrKey);
+      if (tauBars >= marketProfile.barsPerSession) {
+        return `${(tauBars / marketProfile.barsPerSession).toFixed(2)} sess`;
+      }
+
+      const minutes = tauBars * marketProfile.barMinutes;
+      if (minutes >= 60) {
+        return `${(minutes / 60).toFixed(2)} h`;
+      }
+
+      return `${minutes.toFixed(0)} min`;
+    }
+
+    function kalmanModelParams(returns, marketProfileOrKey = DEFAULT_PROFILE_KEY, tauBars = null) {
+      const marketProfile = getMarketProfile(marketProfileOrKey);
+      const dt = marketProfile.dtYears;
+      const tauLBars = Math.max(tauBars ?? marketProfile.defaultTauBars, 1);
+      const tauL = tauLBars * dt;
+      const F = Math.exp(-1 / tauLBars);
+      const { variance } = meanAndVariance(returns);
+      const varR = Math.max(variance, 1e-10);
+      const alpha = 1 - F;
+      const Q = Math.max(varR * (1 - F * F), 1e-10);
+      const R = Math.max(varR * 0.45, 1e-10);
+      const initialVariance = Math.max(varR, Q / Math.max(1 - F * F, 1e-6), 1e-10);
+      return {
+        dt,
+        tauL,
+        tauLBars,
+        tauL_days: tauLBars / marketProfile.barsPerSession,
+        tauL_hours: (tauLBars * marketProfile.barMinutes) / 60,
+        F,
+        varR,
+        alpha,
+        Q,
+        R,
+        initialVariance,
+        barMinutes: marketProfile.barMinutes,
+        barsPerSession: marketProfile.barsPerSession,
+        annualizationBars: marketProfile.annualizationBars,
+        intervalLabel: marketProfile.intervalLabel,
+        key: marketProfile.key,
+        windowLabel: marketProfile.windowLabel,
+      };
+    }
+
+    function kalmanFilterPass(returns, model) {
+      if (!returns || returns.length === 0) {
+        return { vSeries: [], logLikelihood: 0 };
+      }
+
+      const { F, initialVariance, Q, R } = model;
+      const v = new Array(returns.length).fill(0);
+      let P = Math.max(initialVariance, 1e-10);
+      let vEst = returns[0];
+      v[0] = vEst;
+      let logLikelihood = 0;
+
+      for (let index = 1; index < returns.length; index += 1) {
+        const vPred = F * vEst;
+        const PPred = F * F * P + Q;
+        const innovationVar = Math.max(PPred + R, 1e-10);
+        const innovation = returns[index] - vPred;
+        const K = PPred / innovationVar;
+        vEst = vPred + K * innovation;
+        P = (1 - K) * PPred;
+        v[index] = vEst;
+        logLikelihood += -0.5 * (Math.log(2 * Math.PI * innovationVar) + (innovation * innovation) / innovationVar);
+      }
+
+      return { vSeries: v, logLikelihood };
+    }
+
+    function kalmanFilter(returns, modelOrTau = DEFAULT_PROFILE_KEY) {
+      const model = typeof modelOrTau === "number" ? kalmanModelParams(returns, DEFAULT_PROFILE_KEY, modelOrTau) : modelOrTau;
+      const resolvedModel = model && typeof model === "object" && "F" in model ? model : kalmanModelParams(returns, modelOrTau);
+      return kalmanFilterPass(returns, resolvedModel).vSeries;
+    }
+
+    function estimateStateSpaceParams(returns, marketProfileOrKey = DEFAULT_PROFILE_KEY, tauBars = null, maxIter = 24) {
+      const marketProfile = getMarketProfile(marketProfileOrKey);
+      const initial = kalmanModelParams(returns, marketProfile, tauBars ?? marketProfile.defaultTauBars);
+      const bounds = {
+        minTauBars: marketProfile.minTauBars,
+        maxTauBars: marketProfile.maxTauBars,
+        minProcessFrac: 0.0025,
+        maxProcessFrac: 0.40,
+        minMeasureFrac: 0.05,
+        maxMeasureFrac: 3.0,
+        tauPenaltyWeight: 0.02,
+      };
+      const priorTauBars = Math.min(bounds.maxTauBars, Math.max(bounds.minTauBars, initial.tauLBars));
+
+      function clamp(value, min, max) {
+        return Math.min(max, Math.max(min, value));
+      }
+
+      function logisticUnit(value) {
+        return 1 / (1 + Math.exp(-value));
+      }
+
+      function logitUnit(value) {
+        const clipped = clamp(value, 1e-6, 1 - 1e-6);
+        return Math.log(clipped / (1 - clipped));
+      }
+
+      function decodeParams(theta) {
+        const tauLBars = bounds.minTauBars + logisticUnit(theta.tau) * (bounds.maxTauBars - bounds.minTauBars);
+        const F = Math.exp(-1 / tauLBars);
+        const processFrac = bounds.minProcessFrac + logisticUnit(theta.q) * (bounds.maxProcessFrac - bounds.minProcessFrac);
+        const measureFrac = bounds.minMeasureFrac + logisticUnit(theta.r) * (bounds.maxMeasureFrac - bounds.minMeasureFrac);
+        const Q = Math.max(initial.varR * processFrac, 1e-10);
+        const R = Math.max(initial.varR * measureFrac, 1e-10);
+        return {
+          ...initial,
+          tauLBars,
+          tauL: tauLBars * marketProfile.dtYears,
+          tauL_days: tauLBars / marketProfile.barsPerSession,
+          tauL_hours: (tauLBars * marketProfile.barMinutes) / 60,
+          F,
+          alpha: 1 - F,
+          Q,
+          R,
+          initialVariance: Math.max(initial.varR, Q / Math.max(1 - F * F, 1e-6), 1e-10),
+        };
+      }
+
+      function scoreTheta(theta) {
+        const model = decodeParams(theta);
+        const negLogLikelihood = -kalmanFilterPass(returns, model).logLikelihood;
+        const tauPenalty = returns.length * bounds.tauPenaltyWeight * (Math.log(model.tauLBars / priorTauBars) ** 2);
+        return negLogLikelihood + tauPenalty;
+      }
+
+      const initialProcessFrac = clamp(initial.Q / initial.varR, bounds.minProcessFrac, bounds.maxProcessFrac);
+      const initialMeasureFrac = clamp(initial.R / initial.varR, bounds.minMeasureFrac, bounds.maxMeasureFrac);
+
+      let theta = {
+        tau: logitUnit((priorTauBars - bounds.minTauBars) / (bounds.maxTauBars - bounds.minTauBars)),
+        q: logitUnit((initialProcessFrac - bounds.minProcessFrac) / (bounds.maxProcessFrac - bounds.minProcessFrac)),
+        r: logitUnit((initialMeasureFrac - bounds.minMeasureFrac) / (bounds.maxMeasureFrac - bounds.minMeasureFrac)),
+      };
+      let stepSizes = { tau: 0.8, q: 0.8, r: 0.8 };
+      let bestScore = scoreTheta(theta);
+
+      for (let iter = 0; iter < maxIter; iter += 1) {
+        let improved = false;
+
+        for (const key of ["tau", "q", "r"]) {
+          let bestLocalTheta = theta[key];
+          let bestLocalScore = bestScore;
+
+          for (const direction of [-1, 1]) {
+            const candidateTheta = { ...theta, [key]: theta[key] + direction * stepSizes[key] };
+            const candidateScore = scoreTheta(candidateTheta);
+
+            if (candidateScore < bestLocalScore - 1e-6) {
+              bestLocalScore = candidateScore;
+              bestLocalTheta = candidateTheta[key];
+            }
+          }
+
+          if (bestLocalScore < bestScore - 1e-6) {
+            theta = { ...theta, [key]: bestLocalTheta };
+            bestScore = bestLocalScore;
+            improved = true;
+          }
+        }
+
+        if (!improved) {
+          stepSizes = {
+            tau: stepSizes.tau * 0.5,
+            q: stepSizes.q * 0.5,
+            r: stepSizes.r * 0.5,
+          };
+          if (Math.max(stepSizes.tau, stepSizes.q, stepSizes.r) < 0.02) {
+            break;
+          }
+        }
+      }
+
+      return decodeParams(theta);
     }
 
     function gaussianPDF(x, mu, sigma) {
@@ -95,7 +321,8 @@ function kalmanModelParams(returns, tauL_days = 10) {
       return { pCrash: p1 / total, pBull: p2 / total };
     }
 
-    function estimateTauLDays(series) {
+    function estimateTauScale(series, marketProfileOrKey = DEFAULT_PROFILE_KEY) {
+      const marketProfile = getMarketProfile(marketProfileOrKey);
       const mean = series.reduce((a, b) => a + b, 0) / series.length;
       let num = 0;
       let den = 0;
@@ -104,7 +331,13 @@ function kalmanModelParams(returns, tauL_days = 10) {
         den += (series[index] - mean) ** 2;
       }
       const acf1 = Math.min(0.999, Math.max(num / (den + 1e-10), 0.001));
-      return { acf1, tauL_days: -1 / Math.log(acf1) };
+      const tauLBars = -1 / Math.log(acf1);
+      return {
+        acf1,
+        tauLBars,
+        tauL_days: tauLBars / marketProfile.barsPerSession,
+        tauL_hours: (tauLBars * marketProfile.barMinutes) / 60,
+      };
     }
 
     function logPdfGradient(v, pdf) {
@@ -130,14 +363,15 @@ function kalmanModelParams(returns, tauL_days = 10) {
 
     function langevinDrift(v, pdf, tauL_days, processVar) {
       const tauSteps = Math.max(tauL_days, 1);
-      return (-v / tauSteps) + 0.5 * processVar * logPdfGradient(v, pdf);
+      const reversionFactor = Math.exp(-1 / tauSteps);
+      return ((reversionFactor - 1) * v) + 0.5 * processVar * logPdfGradient(v, pdf);
     }
 
-    function refineMomentumEKF(returns, seedSeries, tauL_days, passes = 3) {
-      const observationMean = returns.reduce((a, b) => a + b, 0) / returns.length;
-      const observationVar = returns.reduce((sum, value) => sum + (value - observationMean) ** 2, 0) / returns.length;
-      const measureVar = Math.max(observationVar * 0.45, 1e-8);
-      const processVar = Math.max(observationVar * 0.06, 1e-8);
+    function refineMomentumEKF(returns, seedSeries, modelParams, passes = 3) {
+      const observationVar = Math.max(modelParams.initialVariance || modelParams.varR, 1e-8);
+      const measureVar = Math.max(modelParams.R, 1e-8);
+      const processVar = Math.max(modelParams.Q, 1e-8);
+      const tauL_days = modelParams.tauL_days;
       let vSeries = seedSeries.slice();
       let pdf = fitBimodalEM(vSeries);
 
@@ -145,11 +379,13 @@ function kalmanModelParams(returns, tauL_days = 10) {
         const refined = new Array(returns.length).fill(0);
         let P = observationVar;
         let vEst = pass === 0 ? seedSeries[0] : vSeries[0];
+        refined[0] = vEst;
 
-        for (let index = 0; index < returns.length; index += 1) {
+        for (let index = 1; index < returns.length; index += 1) {
           const drift = langevinDrift(vEst, pdf, tauL_days, processVar);
           const tauSteps = Math.max(tauL_days, 1);
-          const jacobian = Math.max(0.2, Math.min(1.25, 1 - (1 / tauSteps) + 0.5 * processVar * logPdfCurvature(vEst, pdf)));
+          const reversionFactor = Math.exp(-1 / tauSteps);
+          const jacobian = Math.max(0.2, Math.min(1.25, reversionFactor + 0.5 * processVar * logPdfCurvature(vEst, pdf)));
           const vPred = vEst + drift;
           const PPred = jacobian * P * jacobian + processVar;
           const K = PPred / (PPred + measureVar);
@@ -165,18 +401,20 @@ function kalmanModelParams(returns, tauL_days = 10) {
       return { vSeries, pdf, processVar, measureVar, filterType: "EKF" };
     }
 
-    function summarizeAnalysis(returns, vSeries, filterType, processVar, knownPdf = null) {
+    function summarizeAnalysis(returns, vSeries, filterType, processVar, knownPdf = null, modelParams = null, marketProfileOrKey = DEFAULT_PROFILE_KEY) {
+      const marketProfile = getMarketProfile(modelParams || marketProfileOrKey);
       const pdf = knownPdf || fitBimodalEM(vSeries);
       const vCurrent = vSeries[vSeries.length - 1];
       const probabilities = regimeProbabilities(vCurrent, pdf);
       const confidence = Math.abs(probabilities.pBull - probabilities.pCrash);
-      const tau = estimateTauLDays(vSeries);
+      const tau = estimateTauScale(vSeries, marketProfile);
       const recent = returns.slice(-20);
-      const volReal = Math.sqrt(recent.reduce((sum, value) => sum + value * value, 0) / recent.length) * Math.sqrt(252);
-      const driftCurrent = (-vCurrent / Math.max(tau.tauL_days, 1)) + 0.5 * processVar * logPdfGradient(vCurrent, pdf);
+      const volReal = Math.sqrt(recent.reduce((sum, value) => sum + value * value, 0) / recent.length) * Math.sqrt(marketProfile.annualizationBars);
+      const calibratedTau = modelParams?.tauLBars || tau.tauLBars;
+      const driftCurrent = langevinDrift(vCurrent, pdf, calibratedTau, processVar);
       const regime = confidence < 0.20 ? "TRANSITION" : probabilities.pCrash > probabilities.pBull ? "BEAR" : "BULL";
-      const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
-      const std = Math.sqrt(returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / returns.length);
+      const { mean, variance } = meanAndVariance(returns);
+      const std = Math.max(Math.sqrt(variance), 1e-8);
       const skewness = returns.reduce((sum, value) => sum + ((value - mean) / std) ** 3, 0) / returns.length;
 
       return {
@@ -187,11 +425,19 @@ function kalmanModelParams(returns, tauL_days = 10) {
         pBull: probabilities.pBull,
         confidence,
         regime,
-        tauL_est: tau.tauL_days,
+        tauL_calibrated: calibratedTau,
+        tauL_est: tau.tauLBars,
+        tauL_calibratedClock: formatTauClock(calibratedTau, marketProfile),
+        tauL_estClock: formatTauClock(tau.tauLBars, marketProfile),
         volReal,
         acf1: tau.acf1,
         driftCurrent,
         processVol: Math.sqrt(processVar),
+        measureVol: Math.sqrt(Math.max(modelParams?.R || 0, 0)),
+        intervalLabel: marketProfile.intervalLabel,
+        barMinutes: marketProfile.barMinutes,
+        barsPerSession: marketProfile.barsPerSession,
+        historyLabel: marketProfile.windowLabel,
         filterType,
         skewness,
         returns,
@@ -200,17 +446,27 @@ function kalmanModelParams(returns, tauL_days = 10) {
       };
     }
 
-    function analyzeReturns(returns, tauL_days = 12) {
+    function analyzeReturns(returns, marketProfileOrTau = DEFAULT_PROFILE_KEY) {
       if (!returns || returns.length < 20) {
         return null;
       }
 
-      const seedParams = kalmanModelParams(returns, tauL_days);
-      const seedSeries = kalmanFilter(returns, tauL_days);
-      const seedTau = estimateTauLDays(seedSeries);
-      const refined = refineMomentumEKF(returns, seedSeries, seedTau.tauL_days);
-      const linearAnalysis = summarizeAnalysis(returns, seedSeries, "Linear KF", seedParams.Q);
-      const ekfAnalysis = summarizeAnalysis(returns, refined.vSeries, refined.filterType, refined.processVar, refined.pdf);
+      const marketProfile = typeof marketProfileOrTau === "number" ? getMarketProfile(DEFAULT_PROFILE_KEY) : getMarketProfile(marketProfileOrTau);
+      const tauBars = typeof marketProfileOrTau === "number" ? marketProfileOrTau : marketProfile.defaultTauBars;
+
+      const seedParams = estimateStateSpaceParams(returns, marketProfile, tauBars);
+      const seedSeries = kalmanFilter(returns, seedParams);
+      const refined = refineMomentumEKF(returns, seedSeries, seedParams);
+      const linearAnalysis = summarizeAnalysis(returns, seedSeries, "Linear KF", seedParams.Q, null, seedParams, marketProfile);
+      const ekfAnalysis = summarizeAnalysis(
+        returns,
+        refined.vSeries,
+        refined.filterType,
+        refined.processVar,
+        refined.pdf,
+        { ...seedParams, Q: refined.processVar, R: refined.measureVar },
+        marketProfile
+      );
 
       return {
         ...ekfAnalysis,
@@ -224,9 +480,37 @@ function kalmanModelParams(returns, tauL_days = 10) {
       };
     }
 
-    async function fetchMarketData(ticker) {
+    function formatExchangeTimestamp(timestamp, gmtOffsetSeconds = 0, includeTime = true) {
+      const exchangeDate = new Date((timestamp + gmtOffsetSeconds) * 1000);
+      const year = exchangeDate.getUTCFullYear();
+      const month = String(exchangeDate.getUTCMonth() + 1).padStart(2, "0");
+      const day = String(exchangeDate.getUTCDate()).padStart(2, "0");
+      if (!includeTime) {
+        return `${year}-${month}-${day}`;
+      }
+
+      const hours = String(exchangeDate.getUTCHours()).padStart(2, "0");
+      const minutes = String(exchangeDate.getUTCMinutes()).padStart(2, "0");
+      return `${year}-${month}-${day} ${hours}:${minutes}`;
+    }
+
+    function parseYahooChartResult(payload, normalized) {
+      const result = payload?.chart?.result?.[0];
+      const error = payload?.chart?.error;
+      if (error) {
+        throw new Error(error.description || `No market data found for ${normalized}`);
+      }
+      if (!result) {
+        throw new Error(`Unexpected market data payload for ${normalized}`);
+      }
+      return result;
+    }
+
+    async function fetchMarketData(ticker, marketProfileOrSignal, maybeSignal) {
       const normalized = ticker.trim().toUpperCase();
-      const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(normalized)}?range=6mo&interval=1d&includePrePost=false&events=div%2Csplits`;
+      const signal = maybeSignal || (marketProfileOrSignal && typeof marketProfileOrSignal === "object" && "aborted" in marketProfileOrSignal ? marketProfileOrSignal : undefined);
+      const marketProfile = maybeSignal ? getMarketProfile(marketProfileOrSignal) : signal ? getMarketProfile(DEFAULT_PROFILE_KEY) : getMarketProfile(marketProfileOrSignal);
+      const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(normalized)}?range=${marketProfile.yahooRange}&interval=${marketProfile.yahooInterval}&includePrePost=false&events=div%2Csplits`;
       const PROXIES = [
         (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
         (u) => `https://thingproxy.freeboard.io/fetch/${u}`,
@@ -234,63 +518,66 @@ function kalmanModelParams(returns, tauL_days = 10) {
       ];
 
       async function tryFetch(url) {
-        const response = await fetch(url, { cache: "no-store" });
+        const response = await fetch(url, { cache: "no-store", signal });
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
         }
-        return response;
+        let payload;
+        try {
+          payload = await response.json();
+        } catch (error) {
+          throw new Error("Invalid JSON response");
+        }
+        return parseYahooChartResult(payload, normalized);
       }
 
-      let response;
+      let result;
       let viaProxy = false;
       let lastError;
 
       try {
-        response = await tryFetch(yahooUrl);
+        result = await tryFetch(yahooUrl);
       } catch (error) {
+        if (error.name === "AbortError") {
+          throw error;
+        }
         lastError = error;
       }
 
-      if (!response) {
+      if (!result) {
         for (const makeProxy of PROXIES) {
           try {
-            response = await tryFetch(makeProxy(yahooUrl));
+            result = await tryFetch(makeProxy(yahooUrl));
             viaProxy = true;
             break;
           } catch (error) {
+            if (error.name === "AbortError") {
+              throw error;
+            }
             lastError = error;
           }
         }
       }
 
-      if (!response) {
-        throw new Error(`Unable to load market data – all sources failed. ${lastError?.message || ""}`);
-      }
-
-      const payload = await response.json();
-      const result = payload?.chart?.result?.[0];
-      const error = payload?.chart?.error;
-      if (error) {
-        throw new Error(error.description || `No market data found for ${normalized}`);
-      }
       if (!result) {
-        throw new Error(`No market data found for ${normalized}`);
+        throw new Error(`Unable to load market data – all sources failed. ${lastError?.message || ""}`);
       }
 
       const timestamps = result.timestamp || [];
       const closes = result.indicators?.quote?.[0]?.close || [];
+      const exchangeOffsetSeconds = Number(result.meta?.gmtoffset) || 0;
       const rows = timestamps
         .map((timestamp, index) => ({
-          date: new Date(timestamp * 1000).toISOString().slice(0, 10),
+          date: formatExchangeTimestamp(timestamp, exchangeOffsetSeconds, true),
           close: Number(closes[index]),
         }))
         .filter((row) => Number.isFinite(row.close));
 
-      if (rows.length < 30) {
+      if (rows.length < Math.max(40, marketProfile.replayWarmupBars + 10)) {
         throw new Error(`Insufficient history returned for ${normalized}`);
       }
 
-      const recent = rows.slice(-90);
+      const recent = rows;
       return {
         ticker: result.meta?.symbol || normalized,
         name: result.meta?.longName || result.meta?.shortName || normalized,
@@ -298,11 +585,14 @@ function kalmanModelParams(returns, tauL_days = 10) {
         dates: recent.map((row) => row.date),
         currency: result.meta?.currency || "USD",
         lastDate: recent[recent.length - 1].date,
+        intervalLabel: marketProfile.intervalLabel,
+        historyLabel: marketProfile.windowLabel,
+        barMinutes: marketProfile.barMinutes,
         viaProxy,
       };
     }
 
-  const APP_VERSION = "2026-05-03";
+  const APP_VERSION = "2026-05-05";
   const QUICK_PICKS = ["SPY", "QQQ", "AAPL", "NVDA", "BTC-USD", "GLD"];
     const RATIONALE_SECTIONS = [
       {
@@ -315,11 +605,11 @@ function kalmanModelParams(returns, tauL_days = 10) {
       },
       {
         title: "What the math is trying to preserve",
-        body: "The Thomson well-mixed idea matters because it says the drift term should be consistent with the observed stationary distribution. In plain language: if momentum is empirically distributed in an asymmetric, two-regime way, the dynamics should not assume a single Gaussian world. The mean-reverting part controls persistence through tau_L, while the distribution-sensitive correction keeps the process aligned with the fitted bimodal density. In this standalone version that correction enters an extended-Kalman-style update after the initial linear estimate.",
+        body: "The Thomson well-mixed idea is the guide rather than a claim of exact derivation in this browser model. In plain language: if momentum is empirically distributed in an asymmetric, two-regime way, the dynamics should not assume a single Gaussian world. The hidden state keeps an OU-style exact discrete mean reversion through tau_L, while a density-sensitive correction nudges the state toward the fitted bimodal PDF. In this standalone version that correction enters an extended-Kalman-style update after the initial linear estimate.",
       },
       {
         title: "Why the dashboard looks the way it does",
-        body: "Each panel maps directly to one piece of the model. A linear Kalman pass gives an initial hidden momentum estimate, then an EKF-style nonlinear Langevin update propagates that state using a drift consistent with the fitted bimodal density. The EM fit estimates the two momentum modes. Bayesian responsibilities convert the current v(t) into bear-versus-bull probabilities, while a transition label is derived from low posterior confidence rather than from an invented third Gaussian. The gauge, probability bars, PDF view, and suggested exposure are all different views of the same latent-state inference pipeline.",
+        body: "Each panel maps directly to one piece of the model. A linear Kalman pass gives an initial hidden momentum estimate under the observation model r_t = v_t + noise, then an EKF-style nonlinear update propagates that state with exact discrete mean reversion and a density-sensitive correction. The EM fit estimates the two momentum modes. Bayesian responsibilities convert the current v(t) into bear-versus-bull probabilities, while a transition label is derived from low posterior confidence rather than from an invented third Gaussian. The gauge, probability bars, PDF view, and suggested exposure are all different views of the same latent-state inference pipeline.",
       },
     ];
     const ANALOGY_ROWS = [
@@ -334,12 +624,15 @@ function kalmanModelParams(returns, tauL_days = 10) {
 
     const state = {
       ticker: "",
+      marketProfileKey: DEFAULT_PROFILE_KEY,
       view: "tool",
       status: "idle",
-      statusMsg: "Ready. Uses Yahoo Finance chart data directly from the browser.",
+      statusMsg: "Ready. Uses Yahoo Finance 5m/15m regular-session chart data directly from the browser.",
       rawData: null,
       analysis: null,
     };
+    let activeRunId = 0;
+    let activeRunController = null;
 
     function escapeHtml(value) {
       return String(value ?? "")
@@ -365,6 +658,33 @@ function kalmanModelParams(returns, tauL_days = 10) {
         return "Bullish momentum is stable. Long exposure remains favored with risk control.";
       }
       return "Neutral regime. Wait for confirmation before changing exposure.";
+    }
+
+    function renderUsagePanel(marketProfile) {
+      return `
+        <div class="panel usage-panel animate-in">
+          <div class="panel-label">How To Use</div>
+          <div class="usage-grid">
+            <div class="usage-step">
+              <div class="usage-step-title">1. Set timeframe</div>
+              <div class="usage-step-copy">Start on <strong>15m</strong> for backdrop. Switch to <strong>5m</strong> only when you want tighter timing.</div>
+            </div>
+            <div class="usage-step">
+              <div class="usage-step-title">2. Read state first</div>
+              <div class="usage-step-copy">Use <strong>Current regime</strong> and <strong>Posterior weights</strong> before looking at any other panel.</div>
+            </div>
+            <div class="usage-step">
+              <div class="usage-step-title">3. Confirm alignment</div>
+              <div class="usage-step-copy">Check that <strong>v(t)</strong>, <strong>drift(v_t)</strong>, and <strong>tau_L (clock)</strong> support the same story.</div>
+            </div>
+            <div class="usage-step">
+              <div class="usage-step-title">4. Be selective</div>
+              <div class="usage-step-copy">Best reads are when <strong>KF</strong> and <strong>EKF</strong> agree. Ignore low-confidence <strong>TRANSITION</strong> states.</div>
+            </div>
+          </div>
+          <div class="usage-footnote">Mode now selected: ${escapeHtml(marketProfile.intervalLabel)} bars over ${escapeHtml(marketProfile.windowLabel)}. Regular session only.</div>
+        </div>
+      `;
     }
 
     function renderSparkline(data, color, height = 140, showZero = true) {
@@ -533,18 +853,20 @@ function kalmanModelParams(returns, tauL_days = 10) {
       return { lo: Math.max(0, center - margin), hi: Math.min(1, center + margin) };
     }
 
-    function buildHistoricalReplay(prices, dates, tauL_days = 12, warmup = 45, maxRows = 10) {
-      if (!prices || prices.length < warmup + 2) {
+    function buildHistoricalReplay(prices, dates, marketProfileOrTau = DEFAULT_PROFILE_KEY, warmup = null, maxRows = null) {
+      const marketProfile = typeof marketProfileOrTau === "number" ? getMarketProfile(DEFAULT_PROFILE_KEY) : getMarketProfile(marketProfileOrTau);
+      const tauBars = typeof marketProfileOrTau === "number" ? marketProfileOrTau : marketProfile.defaultTauBars;
+      const replayWarmup = warmup ?? marketProfile.replayWarmupBars;
+      const replayRows = maxRows ?? marketProfile.replayRows;
+
+      if (!prices || prices.length < replayWarmup + 2) {
         return null;
       }
       const rows = [];
-      for (let endPriceIndex = warmup; endPriceIndex < prices.length - 1; endPriceIndex += 1) {
+      for (let endPriceIndex = replayWarmup; endPriceIndex < prices.length - 1; endPriceIndex += 1) {
         const windowPrices = prices.slice(0, endPriceIndex + 1);
-        const windowReturns = [];
-        for (let index = 1; index < windowPrices.length; index += 1) {
-          windowReturns.push(Math.log(windowPrices[index] / windowPrices[index - 1]));
-        }
-        const snapshot = analyzeReturns(windowReturns, tauL_days);
+        const windowReturns = computeLogReturns(windowPrices);
+        const snapshot = analyzeReturns(windowReturns, typeof marketProfileOrTau === "number" ? tauBars : marketProfile);
         if (!snapshot) {
           continue;
         }
@@ -564,7 +886,7 @@ function kalmanModelParams(returns, tauL_days = 10) {
         });
       }
 
-      const recentRows = rows.slice(-maxRows).reverse();
+      const recentRows = rows.slice(-replayRows).reverse();
       const hitCount = recentRows.filter((row) => row.hit).length;
       const hitRate = recentRows.length ? hitCount / recentRows.length : 0;
       const ci = wilsonCI(hitCount, recentRows.length);
@@ -588,9 +910,9 @@ function kalmanModelParams(returns, tauL_days = 10) {
               This app comes from the idea that market returns can be modeled like the motion of a particle in a turbulent convective boundary layer. Instead of assuming one symmetric market state, it assumes that the hidden momentum process can occupy different modes with different intensity, persistence, and tail behavior. That is the reason the interface estimates a latent state first and classifies regimes second.
             </div>
             <div class="equation-box">
-              d log(S_t) = v_t dt<br>
-              dv_t = a(v_t) dt + sigma dW_t<br>
-              a(v) = -v / tau_L + distribution correction from the fitted bimodal PDF
+              r_t = Delta log(S_t) = v_t + epsilon_t<br>
+              v_next = F v_t + eta_t<br>
+              EKF drift: a(v) = (F - 1) v + 0.5 q d/dv ln p(v)
             </div>
           </div>
           <div class="rationale-grid">
@@ -623,7 +945,7 @@ function kalmanModelParams(returns, tauL_days = 10) {
             </div>
           </div>
           <div class="rationale-note">
-            The interface is therefore best read as a regime estimation instrument. It translates the original idea from the shared discussion into a concrete workflow: retrieve recent prices, infer latent momentum, fit an asymmetric bimodal distribution, and report which side of that distribution the market currently resembles.
+            The interface is therefore best read as a regime estimation instrument. It translates the original idea from the shared discussion into a reduced-form workflow: retrieve recent prices, infer latent momentum from a discrete state-space model, fit an asymmetric bimodal distribution, and report which side of that distribution the market currently resembles.
           </div>
         </div>
       `;
@@ -636,23 +958,24 @@ function kalmanModelParams(returns, tauL_days = 10) {
             <div class="panel-label">Theory</div>
             <div class="rationale-title">Theoretical Foundations of the Langevin Regime Model</div>
             <div class="rationale-lead">
-              The core theory maps the physical well-mixed condition of turbulent convective boundary layers to financial momentum stochastic equations. This model departs from Gaussian asset pricing by treating the market as a non-equilibrium system where asymmetric structural drift and local noise generate heavy-tailed bimodal distributions.
+              The theory borrows the well-mixed convective-boundary-layer analogy, but the implementation is a reduced-form financial state-space model. Intraday bar log returns are treated as noisy observations of latent momentum, and the nonlinear correction is tied to the fitted bimodal density rather than to a full closed-form market diffusion.
             </div>
             <div class="equation-box">
-              1. Extended Kalman Filter (EKF) State Update<br>
-              v_t = a(v_t) dt + EKF_correction(v_t, obs)<br><br>
-              2. Analytical Jacobian<br>
-              H = d/dv a(v) = -1/tau_L + 0.5 * sigma^2 * d²/dv² ln p(v)
+              1. Observation model<br>
+              r_t = Delta log(S_t) = v_t + epsilon_t<br><br>
+              2. State update and Jacobian<br>
+              v_next = F v_t + 0.5 q d/dv ln p(v_t) + eta_t<br>
+              H(v) = F + 0.5 q d^2/dv^2 ln p(v)
             </div>
           </div>
           <div class="rationale-grid">
             <div class="rationale-card">
               <h2>Stochastic Differential Core</h2>
-              <p>The application relies on Thomson's (1987) derivation where the Fokker-Planck equation corresponds to a Langevin process (<i>Thomson D.J, 1987, Criteria for the selection of stochastic models of particle trajectories in turbulent flows, Journal of Fluid Mechanics, 180, 529-556</i>). By imposing the well-mixed condition, a particle starting in a region with specific distribution properties will dynamically remain consistent with that aggregate PDF. In finance, this translates to trend estimators preserving realistic skewness observed in bear/bull asymmetries rather than regressing linearly to an incorrect single mean.</p>
+              <p>The application is inspired by Thomson's (1987) well-mixed reasoning, where the stationary density and the drift of a Langevin process must stay aligned (<i>Thomson D.J, 1987, Criteria for the selection of stochastic models of particle trajectories in turbulent flows, Journal of Fluid Mechanics, 180, 529-556</i>). In this app, that idea is implemented as an OU-style latent state with exact discrete mean reversion and an empirical correction based on the gradient of the fitted bimodal momentum density. The financial interpretation is therefore reduced-form: preserve observed asymmetry in latent momentum rather than force the dynamics into a single symmetric Gaussian world.</p>
             </div>
             <div class="rationale-card">
               <h2>Limitations &amp; Mathematical Assumptions</h2>
-              <p>While the Jacobian derivation and probability updates are exact closed-form expressions, the model operates heuristically in parameter calibration. EKF covariance matrices (Q and R) and the bimodal EM iterations lack longitudinal risk-neutral bounds, acting strictly as dynamic filters. Future theory could couple this with Maximum Likelihood Estimation (MLE) or full Particle Filtering spanning multiple tau_L relaxation bounds.</p>
+              <p>The Jacobian and posterior updates are exact for the chosen reduced-form drift, and the linear backbone now calibrates tau_L, Q, and R jointly by maximizing the innovation likelihood of the scalar state-space model within intraday identifiability bounds and a mild tau prior. The bimodal EM fit remains a practical reduced-form component rather than a fully identified structural asset-pricing system. Further upgrades would compare this density-aware EKF against particle filtering or explicit regime-switching state-space models.</p>
             </div>
           </div>
         </div>
@@ -662,17 +985,18 @@ function kalmanModelParams(returns, tauL_days = 10) {
     function renderToolView() {
       const analysis = state.analysis;
       const rawData = state.rawData;
+      const marketProfile = getMarketProfile(state.marketProfileKey);
       const color = analysis ? regimeColor(analysis.regime) : "#4a6280";
       const advice = adviceText(analysis);
       const dotClass = state.status === "idle" ? "done" : state.status;
 
-      let gridContent = "";
+      let gridContent = renderUsagePanel(marketProfile);
       if (rawData && analysis) {
         gridContent += `
           <div class="ticker-badge animate-in">
             <div class="ticker-sym">${escapeHtml(rawData.ticker)}</div>
             <div class="ticker-name">${escapeHtml(rawData.name || "")}</div>
-            <div class="ticker-date">${escapeHtml(rawData.lastDate || "")} · ${rawData.prices.length} days</div>
+            <div class="ticker-date">${escapeHtml(rawData.lastDate || "")} · ${rawData.prices.length} ${escapeHtml(rawData.intervalLabel || marketProfile.intervalLabel)} bars · ${escapeHtml(rawData.historyLabel || marketProfile.windowLabel)}</div>
           </div>
         `;
       }
@@ -681,8 +1005,8 @@ function kalmanModelParams(returns, tauL_days = 10) {
         gridContent += `
           <div class="placeholder">
             <div class="placeholder-icon">⚡</div>
-            <div class="placeholder-title">Enter a ticker to start</div>
-            <div class="placeholder-sub">Direct browser mode · public sources · model runs locally</div>
+            <div class="placeholder-title">Enter a ticker to start intraday tracking</div>
+            <div class="placeholder-sub">Regular session only · ${escapeHtml(marketProfile.intervalLabel)} bars · ${escapeHtml(marketProfile.windowLabel)}</div>
           </div>
         `;
       }
@@ -692,7 +1016,7 @@ function kalmanModelParams(returns, tauL_days = 10) {
           <div class="placeholder">
             <div class="placeholder-icon" style="animation:pulse 1s infinite">🌀</div>
             <div class="placeholder-title">${escapeHtml(state.statusMsg)}</div>
-            <div class="placeholder-sub">Fetching prices · Kalman filter · Bimodal EM · Bayesian regime</div>
+            <div class="placeholder-sub">Fetching intraday bars · Kalman filter · Bimodal EM · Bayesian regime</div>
           </div>
         `;
       }
@@ -744,11 +1068,14 @@ function kalmanModelParams(returns, tauL_days = 10) {
           <div class="panel params-panel animate-in">
             <div class="panel-label">Calibrated CBL parameters</div>
             ${[
-              ["tau_L (days)", `${analysis.tauL_est.toFixed(1)} d`],
+              ["tau_L (cal)", `${analysis.tauL_calibrated.toFixed(1)} bars`],
+              ["tau_L (clock)", analysis.tauL_calibratedClock],
+              ["tau_L (implied)", `${analysis.tauL_est.toFixed(1)} bars`],
               ["ACF(lag=1)", analysis.acf1.toFixed(4)],
-              ["Realized vol", `${(analysis.volReal * 100).toFixed(2)}%`],
-              ["drift(v_t)", `${(analysis.driftCurrent * 100).toFixed(4)}%/day`],
+              ["Realized vol (ann)", `${(analysis.volReal * 100).toFixed(2)}%`],
+              ["drift(v_t)", `${(analysis.driftCurrent * 100).toFixed(4)}%/${analysis.intervalLabel}`],
               ["process sigma", `${(analysis.processVol * 100).toFixed(4)}%`],
+              ["measure sigma", `${(analysis.measureVol * 100).toFixed(4)}%`],
               ["Skewness", analysis.skewness.toFixed(3)],
               ["lambda_1", analysis.pdf.lam1.toFixed(3)],
               ["mu_1", `${(analysis.pdf.mu1 * 100).toFixed(4)}%`],
@@ -773,8 +1100,8 @@ function kalmanModelParams(returns, tauL_days = 10) {
                     <div class="compare-stats">
                       <div><div class="compare-stat-label">Bull weight</div><div class="compare-stat-value">${(item.pBull * 100).toFixed(1)}%</div></div>
                       <div><div class="compare-stat-label">Bear weight</div><div class="compare-stat-value">${(item.pCrash * 100).toFixed(1)}%</div></div>
-                      <div><div class="compare-stat-label">tau_L</div><div class="compare-stat-value">${item.tauL_est.toFixed(1)} d</div></div>
-                      <div><div class="compare-stat-label">drift(v_t)</div><div class="compare-stat-value">${(item.driftCurrent * 100).toFixed(4)}%/day</div></div>
+                      <div><div class="compare-stat-label">tau_L cal</div><div class="compare-stat-value">${item.tauL_calibrated.toFixed(1)} bars</div></div>
+                      <div><div class="compare-stat-label">drift(v_t)</div><div class="compare-stat-value">${(item.driftCurrent * 100).toFixed(4)}%/${item.intervalLabel}</div></div>
                     </div>
                   </div>
                 `;
@@ -783,20 +1110,20 @@ function kalmanModelParams(returns, tauL_days = 10) {
             <div class="compare-delta">
               <span>delta v(t): ${analysis.comparison.deltaMomentum > 0 ? "+" : ""}${(analysis.comparison.deltaMomentum * 100).toFixed(4)}%</span>
               <span>delta bull weight: ${analysis.comparison.deltaBull > 0 ? "+" : ""}${(analysis.comparison.deltaBull * 100).toFixed(1)} pts</span>
-              <span>delta tau_L: ${analysis.comparison.deltaTau > 0 ? "+" : ""}${analysis.comparison.deltaTau.toFixed(1)} d</span>
+              <span>delta tau_L implied: ${analysis.comparison.deltaTau > 0 ? "+" : ""}${analysis.comparison.deltaTau.toFixed(1)} bars</span>
             </div>
           </div>
           ${analysis.replay ? `
             <div class="panel replay-panel animate-in">
-              <div class="panel-label">Historical one-day-ahead replay</div>
+              <div class="panel-label">Historical one-bar-ahead replay</div>
               <div class="replay-summary">
                 <span>recent forecasts: ${analysis.replay.sampleSize}</span>
                 <span>hit rate: ${(analysis.replay.hitRate * 100).toFixed(1)}% [95% CI ${(analysis.replay.ci.lo * 100).toFixed(0)}–${(analysis.replay.ci.hi * 100).toFixed(0)}%]</span>
-                <span>avg next-day move: ${(analysis.replay.avgAbsNextMove * 100).toFixed(2)}%</span>
+                <span>avg next-bar move: ${(analysis.replay.avgAbsNextMove * 100).toFixed(2)}%</span>
                 <span>rule: bull if P(bull) ≥ P(crash), crash otherwise</span>
               </div>
               <div class="replay-table">
-                <div class="replay-row header"><span>As of</span><span>For date</span><span>Predicted</span><span>Confidence</span><span>Realized next return</span></div>
+                <div class="replay-row header"><span>As of</span><span>For bar</span><span>Predicted</span><span>Confidence</span><span>Realized next return</span></div>
                 ${analysis.replay.rows.map((row) => `
                   <div class="replay-row">
                     <span>${escapeHtml(row.asOfDate)}</span>
@@ -810,7 +1137,7 @@ function kalmanModelParams(returns, tauL_days = 10) {
             </div>
           ` : ""}
           <div class="panel chart-panel animate-in">
-            <div class="panel-label">Lagrangian momentum v(t) - Kalman plus ${escapeHtml(analysis.filterType)} Langevin update (${analysis.vSeries.length} observations)</div>
+            <div class="panel-label">Lagrangian momentum v(t) - Kalman plus ${escapeHtml(analysis.filterType)} Langevin update (${analysis.vSeries.length} ${escapeHtml(analysis.intervalLabel)} bars)</div>
             <div class="chart-canvas-wrap">${renderSparkline(analysis.vSeries, color, 130, true)}</div>
             <div style="display:flex;gap:16px;margin-top:8px;font-family:var(--mono);font-size:9px;color:var(--muted);flex-wrap:wrap">
               <span>MIN: ${(Math.min(...analysis.vSeries) * 100).toFixed(3)}%</span>
@@ -843,8 +1170,12 @@ function kalmanModelParams(returns, tauL_days = 10) {
       return `
         <div class="search-row">
           <input id="ticker-input" class="search-input" placeholder="Enter ticker (AAPL, SPY, BTC-USD)..." value="${escapeHtml(state.ticker)}">
+          <select id="profile-select" class="search-select">
+            ${Object.values(INTRADAY_PROFILES).map((profile) => `<option value="${profile.key}" ${profile.key === state.marketProfileKey ? "selected" : ""}>${profile.label}</option>`).join("")}
+          </select>
           <button class="search-btn" data-action="analyze" ${state.status === "loading" ? "disabled" : ""}>${state.status === "loading" ? "..." : "Analyze"}</button>
         </div>
+        <div class="mode-note">Regular session only · ${escapeHtml(marketProfile.intervalLabel)} bars · ${escapeHtml(marketProfile.windowLabel)}</div>
         <div class="quick-picks">
           ${QUICK_PICKS.map((symbol) => `<button class="quick-chip" data-pick="${symbol}">${symbol}</button>`).join("")}
         </div>
@@ -853,7 +1184,7 @@ function kalmanModelParams(returns, tauL_days = 10) {
           <span style="font-family:var(--mono);font-size:11px;color:var(--muted)">${escapeHtml(state.statusMsg)}</span>
         </div>
         <div class="grid">${gridContent}</div>
-        <div style="text-align:center;margin-top:24px;font-family:var(--mono);font-size:9px;color:var(--muted);opacity:0.5">Standalone HTML demo · Yahoo Finance chart API · Not investment advice</div>
+        <div style="text-align:center;margin-top:24px;font-family:var(--mono);font-size:9px;color:var(--muted);opacity:0.5">Intraday HTML demo · Yahoo Finance chart API · Regular session only · Not investment advice</div>
       `;
     }
 
@@ -895,8 +1226,12 @@ function kalmanModelParams(returns, tauL_days = 10) {
     function render() {
       root.innerHTML = renderApp();
       const input = document.getElementById("ticker-input");
+      const profileSelect = document.getElementById("profile-select");
       if (input && document.activeElement !== input) {
         input.value = state.ticker;
+      }
+      if (profileSelect) {
+        profileSelect.value = state.marketProfileKey;
       }
     }
 
@@ -905,42 +1240,65 @@ function kalmanModelParams(returns, tauL_days = 10) {
       if (!currentTicker) {
         return;
       }
+      const marketProfile = getMarketProfile(state.marketProfileKey);
+
+      const runId = activeRunId + 1;
+      activeRunId = runId;
+      if (activeRunController) {
+        activeRunController.abort();
+      }
+      activeRunController = new AbortController();
 
       state.ticker = currentTicker;
       state.view = "tool";
       state.status = "loading";
-      state.statusMsg = `Loading market data for ${currentTicker}...`;
+      state.statusMsg = `Loading ${marketProfile.intervalLabel} bars for ${currentTicker}...`;
       state.analysis = null;
       state.rawData = null;
       render();
 
       try {
-        const data = await fetchMarketData(currentTicker);
+        const data = await fetchMarketData(currentTicker, marketProfile, activeRunController.signal);
+        if (runId !== activeRunId) {
+          return;
+        }
         if (!data.prices || data.prices.length < 20) {
           throw new Error("Insufficient data returned by the public source");
         }
 
         state.rawData = data;
-        state.statusMsg = `Calibrating CBL model for ${currentTicker}...`;
+        state.statusMsg = `Calibrating ${marketProfile.intervalLabel} intraday model for ${currentTicker}...`;
         render();
 
         const prices = data.prices.map(Number).filter(Number.isFinite);
-        const returns = [];
-        for (let index = 1; index < prices.length; index += 1) {
-          returns.push(Math.log(prices[index] / prices[index - 1]));
-        }
+        const returns = computeLogReturns(prices);
 
-        const result = analyzeReturns(returns, 12);
-        const replay = buildHistoricalReplay(prices, data.dates, 12);
+        const result = analyzeReturns(returns, marketProfile);
+        if (!result) {
+          throw new Error("Unable to analyze returned prices");
+        }
+        const replay = buildHistoricalReplay(prices, data.dates, marketProfile);
+        if (runId !== activeRunId) {
+          return;
+        }
         state.analysis = { ...result, replay };
         state.status = "done";
-        state.statusMsg = `${prices.length} prices loaded · ${returns.length} returns · updated ${data.lastDate || "today"}${data.viaProxy ? " · via proxy" : ""}`;
+        state.statusMsg = `${prices.length} ${marketProfile.intervalLabel} bars loaded · ${returns.length} returns · updated ${data.lastDate || "latest"}${data.viaProxy ? " · via proxy" : ""}`;
       } catch (error) {
+        if (error.name === "AbortError" || runId !== activeRunId) {
+          return;
+        }
         state.status = "error";
         state.statusMsg = error.message || "Unknown error while loading data";
+      } finally {
+        if (runId === activeRunId) {
+          activeRunController = null;
+        }
       }
 
-      render();
+      if (runId === activeRunId) {
+        render();
+      }
     }
 
     root.addEventListener("click", (event) => {
@@ -966,6 +1324,17 @@ function kalmanModelParams(returns, tauL_days = 10) {
     root.addEventListener("input", (event) => {
       if (event.target.id === "ticker-input") {
         state.ticker = event.target.value.toUpperCase();
+      }
+    });
+
+    root.addEventListener("change", (event) => {
+      if (event.target.id === "profile-select") {
+        state.marketProfileKey = event.target.value;
+        if (state.ticker.trim() && state.status !== "loading") {
+          run();
+        } else {
+          render();
+        }
       }
     });
 

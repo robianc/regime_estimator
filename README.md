@@ -1,10 +1,8 @@
 # Langevin CBL Regime Estimator
 
-Current version: `2026-05-03`
+Current version: `2026-05-05`
 
-https://robianc.github.io/regime_estimator
-
-A static browser app that estimates market regimes from a latent-momentum model inspired by the Langevin formulation used in convective boundary layer theory.
+A static browser app that estimates intraday regimes from a latent-momentum model inspired by the Langevin formulation used in convective boundary layer theory.
 
 The app runs entirely client-side and combines:
 
@@ -12,7 +10,7 @@ The app runs entirely client-side and combines:
 - an EKF-style nonlinear refinement using a Langevin drift,
 - a two-component Gaussian mixture fit for asymmetric regime structure,
 - Bayesian posterior regime weights,
-- a small historical replay panel for one-day-ahead directional checks.
+- a small historical replay panel for one-bar-ahead directional checks.
 
 ## License
 
@@ -23,7 +21,6 @@ This repository is released under the Apache License 2.0. See [LICENSE](LICENSE)
 - [index.html](index.html): static entrypoint
 - [styles.css](styles.css): styles for the UI
 - [app.js](app.js): model logic, rendering, and browser event wiring
-- [tmp.html](tmp.html): legacy single-file standalone version
 
 ## How To Run
 
@@ -47,7 +44,7 @@ Then open `http://localhost:8000/index.html`.
 
 ## Data Source
 
-The app requests recent market data from Yahoo Finance chart endpoints and falls back to public CORS proxies when needed.
+The app requests recent intraday market data from Yahoo Finance chart endpoints and falls back to public CORS proxies when needed.
 
 Because those sources are third-party services:
 
@@ -58,21 +55,29 @@ Because those sources are third-party services:
 
 ## Model Summary
 
-At a high level, the model assumes that observed returns are noisy measurements of an unobserved momentum process $v_t$.
+At a high level, the model treats intraday bar log returns as noisy observations of an unobserved momentum process $v_t$.
 
-The conceptual structure is:
-
-$$
-d \log(S_t) = v_t \, dt
-$$
+The reduced-form discrete structure is:
 
 $$
-dv_t = a(v_t) \, dt + \sigma \, dW_t
+r_t = \Delta \log(S_t) = v_t + \varepsilon_t
 $$
 
-where the drift term combines mean reversion and a correction linked to the fitted stationary distribution of the latent momentum.
+$$
+v_{t+1} = F v_t + \frac{q}{2}\, \partial_v \log p(v_t) + \eta_t
+$$
 
-This implementation is intentionally lightweight and should be understood as an exploratory estimator rather than a full research calibration stack.
+with
+
+$$
+F = e^{-1 / \tau_L}
+$$
+
+The first term is an OU-style mean-reverting backbone. The second term is a Langevin-inspired empirical correction linked to the fitted stationary density $p(v)$ of the latent momentum.
+
+The linear state-space backbone now calibrates $\tau_L$, $Q$, and $R$ jointly by maximizing the innovation likelihood of the observed return sequence, subject to intraday identifiability bounds and a mild prior on $\tau_L$.
+
+This intraday version uses regular-session 5-minute or 15-minute bars and should still be read as a reduced-form exploratory estimator rather than as a full derivation of an exact financial diffusion or research-grade calibration stack.
 
 ## Disclaimer
 
@@ -95,3 +100,10 @@ Past results shown by the model are **not indicative of future performance**. Ma
 Market data comes from third-party public sources and may contain gaps, delays, revisions, or errors. The authors and contributors assume no liability for losses or damages arising from the use of this software.
 
 If you use this code, you are responsible for validating the methodology, the data, and the suitability of the outputs for your own purposes.
+
+## Notes For GitHub Publication
+
+If you publish this repository, it is a good idea to keep both of these visible:
+
+- the Apache-2.0 license in the root,
+- the disclaimer in this README and in the UI itself.
